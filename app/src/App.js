@@ -1,8 +1,40 @@
 import React, { useState, useEffect, useRef } from 'react';
 import axios from 'axios';
+import Pusher from 'pusher-js';
 import './App.css';
 
 const API_BASE_URL = process.env.REACT_APP_API_URL || 'http://localhost:3001';
+const PUSHER_KEY = process.env.REACT_APP_PUSHER_KEY;
+const PUSHER_CLUSTER = process.env.REACT_APP_PUSHER_CLUSTER;
+const PUSHER_CHANNEL = process.env.REACT_APP_PUSHER_CHANNEL || 'chat-messages';
+
+const isRealEnvValue = (value) => {
+  if (!value) {
+    return false;
+  }
+
+  const normalized = String(value).trim().toLowerCase();
+  if (!normalized) {
+    return false;
+  }
+
+  return !(
+    normalized === 'your_pusher_key' ||
+    normalized === 'your_pusher_cluster' ||
+    normalized === 'changeme' ||
+    normalized === 'placeholder'
+  );
+};
+
+const mergeMessage = (previousMessages, incomingMessage) => {
+  if (previousMessages.some((msg) => msg.id === incomingMessage.id)) {
+    return previousMessages;
+  }
+
+  return [...previousMessages, incomingMessage].sort(
+    (a, b) => new Date(a.created_at) - new Date(b.created_at)
+  );
+};
 
 function App() {
   const [messages, setMessages] = useState([]);
@@ -12,17 +44,142 @@ function App() {
   const [imagePreview, setImagePreview] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  const [searchTerm, setSearchTerm] = useState('');
+  const [searchResults, setSearchResults] = useState([]);
+  const [searchLoading, setSearchLoading] = useState(false);
   const messagesEndRef = useRef(null);
   const fileInputRef = useRef(null);
+  const searchTermRef = useRef('');
+  const isSearchingRef = useRef(false);
+  const isSearching = searchTerm.trim().length > 0;
+  const visibleMessages = isSearching ? searchResults : messages;
 
   useEffect(() => {
     fetchMessages();
   }, []);
 
+  useEffect(() => {
+    searchTermRef.current = searchTerm;
+    isSearchingRef.current = isSearching;
+  }, [searchTerm, isSearching]);
+
+  useEffect(() => {
+    const canUseRealtime = isRealEnvValue(PUSHER_KEY) && isRealEnvValue(PUSHER_CLUSTER);
+    if (!canUseRealtime) {
+      return undefined;
+    }
+
+    let pusher;
+    let channel;
+
+    try {
+      pusher = new Pusher(PUSHER_KEY, {
+        cluster: PUSHER_CLUSTER,
+        // Avoid fallback transport path that can fail in some browser/worker environments.
+        enabledTransports: ['ws', 'wss'],
+        disabledTransports: ['sockjs'],
+      });
+
+      pusher.connection.bind('connected', () => {
+        console.log('✅ Connected to Pusher');
+      });
+
+      pusher.connection.bind('error', (err) => {
+        console.log('❌ Pusher Error', err);
+      });
+
+      channel = pusher.subscribe(PUSHER_CHANNEL);
+      channel.bind('pusher:subscription_succeeded', () => {
+        console.log('✅ Subscribed to channel', PUSHER_CHANNEL);
+      });
+      channel.bind('pusher:subscription_error', (status) => {
+        console.log('❌ Subscription error', status);
+      });
+    } catch (err) {
+      console.error('Pusher initialization failed. Realtime updates are disabled.', err);
+      return undefined;
+    }
+
+    const onNewMessage = (newMessage) => {
+      console.log('Received:', newMessage);
+      setMessages((prev) => mergeMessage(prev, newMessage));
+
+      if (isSearchingRef.current) {
+        setSearchResults((prev) => {
+          const messageBody = (newMessage.message || '').toLowerCase();
+          const usernameText = (newMessage.username || '').toLowerCase();
+          const term = searchTermRef.current.trim().toLowerCase();
+
+          if (!term || (!messageBody.includes(term) && !usernameText.includes(term))) {
+            return prev;
+          }
+
+          if (prev.some((msg) => msg.id === newMessage.id)) {
+            return prev;
+          }
+
+          return [newMessage, ...prev].sort(
+            (a, b) => new Date(b.created_at) - new Date(a.created_at)
+          );
+        });
+      }
+    };
+
+    const onMessageDeleted = (payload) => {
+      const deletedId = payload?.id;
+      if (!deletedId) {
+        return;
+      }
+
+      setMessages((prev) => prev.filter((msg) => msg.id !== deletedId));
+      setSearchResults((prev) => prev.filter((msg) => msg.id !== deletedId));
+    };
+
+    channel.bind('new-message', onNewMessage);
+    channel.bind('message-deleted', onMessageDeleted);
+
+    return () => {
+      channel.unbind('new-message', onNewMessage);
+      channel.unbind('message-deleted', onMessageDeleted);
+      pusher.unsubscribe(PUSHER_CHANNEL);
+      pusher.disconnect();
+    };
+  }, []);
+
+  useEffect(() => {
+    const trimmedQuery = searchTerm.trim();
+
+    if (!trimmedQuery) {
+      setSearchResults([]);
+      setSearchLoading(false);
+      return undefined;
+    }
+
+    const timeoutId = setTimeout(async () => {
+      try {
+        setSearchLoading(true);
+        setError('');
+
+        const response = await axios.get(`${API_BASE_URL}/api/messages/search`, {
+          params: { q: trimmedQuery },
+        });
+
+        setSearchResults(response.data.messages || []);
+      } catch (err) {
+        setSearchResults([]);
+        setError(err.response?.data?.error || 'Failed to search messages');
+      } finally {
+        setSearchLoading(false);
+      }
+    }, 300);
+
+    return () => clearTimeout(timeoutId);
+  }, [searchTerm]);
+
   // Auto-scroll to bottom when new messages arrive
   useEffect(() => {
     scrollToBottom();
-  }, [messages]);
+  }, [visibleMessages]);
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -116,12 +273,7 @@ function App() {
 
       // Refresh messages to show the new one
       if (createdMessage) {
-        setMessages((prev) => {
-          if (prev.some((msg) => msg.id === createdMessage.id)) {
-            return prev;
-          }
-          return [...prev, createdMessage];
-        });
+        setMessages((prev) => mergeMessage(prev, createdMessage));
       }
     } catch (err) {
       setError(err.response?.data?.error || 'Failed to send message');
@@ -158,15 +310,35 @@ function App() {
       </header>
 
       <main className="chat-container">
+        <div className="search-bar">
+          <input
+            type="text"
+            placeholder="Search by message or username..."
+            value={searchTerm}
+            onChange={(e) => setSearchTerm(e.target.value)}
+          />
+          <span className="search-status">
+            {searchLoading
+              ? 'Searching...'
+              : isSearching
+                ? `${searchResults.length} result(s)`
+                : 'Live feed'}
+          </span>
+        </div>
+
         <div className="chat-messages" id="messages-container">
-          {loading && messages.length === 0 ? (
+          {loading && visibleMessages.length === 0 && !isSearching ? (
             <div className="loading">Loading messages...</div>
-          ) : messages.length === 0 ? (
+          ) : searchLoading ? (
+            <div className="loading">Searching messages...</div>
+          ) : visibleMessages.length === 0 ? (
             <div className="no-messages">
-              No messages yet. Start the conversation!
+              {isSearching
+                ? 'No messages match your search.'
+                : 'No messages yet. Start the conversation!'}
             </div>
           ) : (
-            messages.map((msg) => (
+            visibleMessages.map((msg) => (
               <div key={msg.id} className="message-item">
                 <div className="message-header">
                   <span className="message-username">{msg.username}</span>
